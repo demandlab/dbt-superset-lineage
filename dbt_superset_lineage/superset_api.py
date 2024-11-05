@@ -24,18 +24,26 @@ class Superset:
         self.api_url = api_url
         self.access_token = access_token
         self.refresh_token = refresh_token
+        self.csrf_token = None
+        self.session = requests.Session()
 
         if self.access_token is None:
             self._refresh_access_token()
 
-    def _headers(self, **headers):
-        if self.access_token is None:
-            return headers
+    def _get_csrf_token(self):
+        """Retrieve the CSRF token."""
+        csrf_endpoint = "/security/csrf_token/"
+        csrf_response = self.request('GET', csrf_endpoint, refresh_token_if_needed=False)
+        self.csrf_token = csrf_response.get('result')        
+        self.session.headers.update({'X-CSRFToken': csrf_response.get('result')})
 
-        return {
+    def _headers(self, **headers):
+        headers = {
             'Authorization': f'Bearer {self.access_token}',
             **headers,
         }
+
+        return headers
 
     def _refresh_access_token(self):
         logger.debug("Refreshing API token")
@@ -50,7 +58,7 @@ class Superset:
         self.access_token = res['access_token']
 
         logger.debug("Token refreshed successfully")
-        return True
+        return True    
 
     def request(self, method, endpoint, refresh_token_if_needed=True, headers=None,
                 **request_kwargs):
@@ -77,15 +85,19 @@ class Superset:
         if headers is None:
             headers = {}
 
+        # Get CSRF token for all requests except for the one that gets it, or if the CSRF token is already set
+        if endpoint != "/security/csrf_token/" and self.csrf_token is None:
+            self._get_csrf_token()
+
         url = self.api_url + endpoint
-        res = requests.request(method, url, headers=self._headers(**headers), **request_kwargs)
+        res = self.session.request(method, url, headers=self._headers(**headers), **request_kwargs)
 
         logger.debug("Request finished with status: %d", res.status_code)
 
         if refresh_token_if_needed and res.status_code == 401 \
                 and res.json().get('msg') == 'Token has expired' and self._refresh_access_token():
             logger.debug("Retrying %s request for endpoint %s with refreshed token")
-            res = requests.request(method, url, headers=self._headers(**headers))
+            res = self.session.request(method, url, headers=self._headers(**headers))
             logger.debug("Request finished with status: %d", res.status_code)
 
         res.raise_for_status()
