@@ -221,7 +221,7 @@ def put_descriptions_to_superset(superset, dataset, superset_pause_after_update)
 
     if description_new != description_old or \
        not check_columns_equal(columns_new, columns_old):
-        payload = {'description': description_new, 'columns': columns_new, 'owners': owners_new}
+        payload = {'description': description_new, 'columns': columns_new, 'owners': owners_new}        
         superset.request('PUT', f"/dataset/{dataset['id']}?override_columns=false", json=payload)
         pause_after_update(superset_pause_after_update)
     else:

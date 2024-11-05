@@ -145,7 +145,13 @@ def get_dashboards_from_superset(superset, superset_url, superset_db_id):
             dashboard_id = result_dashboard['id']
             title = result_dashboard['dashboard_title']
             url = superset_url + '/superset/dashboard/' + str(dashboard_id)
-            owner_name = result_dashboard['owners'][0]['first_name'] + ' ' + result_dashboard['owners'][0]['last_name']
+
+            # Get the first owner's name, or "Unknown Owner" if there is none
+            owners = result_dashboard.get('owners', [])
+            if owners:
+                owner_name = owners[0]['first_name'] + ' ' + owners[0]['last_name']
+            else:
+                owner_name = "Unknown Owner"
 
             logging.info("Getting info about dashboard's datasets.")
             res_datasets = superset.request('GET', f'/dashboard/{d}/datasets')
