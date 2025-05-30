@@ -1,10 +1,8 @@
-# tests/test_integration_superset_dbt_sync.py
-
-import os
 import json
 import pytest
 import dbt_superset_lineage.push_descriptions as pd
 from dbt_superset_lineage.push_descriptions import main
+from dbt_superset_lineage import superset_api
 
 class StubResponse:
     def __init__(self, data):
@@ -37,7 +35,7 @@ class FakeSuperset:
 
 @pytest.fixture(autouse=True)
 def stub_out_requests(tmp_path, monkeypatch):
-    # 1) Write fixture manifest.json
+    # 1. Write fixture manifest.json
     manifest = {
         'nodes': {
             'model.project.my_schema.my_table': {
@@ -59,14 +57,14 @@ def stub_out_requests(tmp_path, monkeypatch):
     target_dir.mkdir()
     (target_dir / 'manifest.json').write_text(json.dumps(manifest))
 
-    # 2) Prepare our FakeSuperset
+    # 2. Prepare our FakeSuperset
     fake_sup = FakeSuperset()
 
     # Counter to simulate pagination
     list_dataset_calls = {'count': 0}
 
-    # 3) Define a single stub for requests.request
-    def fake_request(method, url, headers=None, params=None, json=None, **kwargs):
+    # 3. Define a single stub for requests.request
+    def fake_request(method, url, _headers=None, _params=None, json=None, **_kwargs):
         # CSRF token fetch
         if url.endswith("/security/csrf_token/"):
             return StubResponse({'result': {'csrf_token': 'fake-csrf'}})
@@ -84,9 +82,8 @@ def stub_out_requests(tmp_path, monkeypatch):
                         'database': {'id': None}
                     }]
                 })
-            else:
-                # no more pages
-                return StubResponse({'result': []})
+            # no more pages
+            return StubResponse({'result': []})
 
         # Fetch dataset details
         if method.upper() == 'GET' and url.endswith("/dataset/1"):
@@ -112,15 +109,14 @@ def stub_out_requests(tmp_path, monkeypatch):
 
         return StubResponse({})
 
-    # 4) Patch the real requests in superset_api
-    import dbt_superset_lineage.superset_api as api
+    # 4. Patch the real requests in superset_api
     RequestsStub = type('R', (), {'request': staticmethod(fake_request)})
-    monkeypatch.setattr(api, 'requests', RequestsStub)
+    monkeypatch.setattr(superset_api, 'requests', RequestsStub)
 
-    # 5) Patch any direct imports in push_descriptions (if present)
+    # 5. Patch any direct imports in push_descriptions (if present)
     monkeypatch.setattr(pd, 'requests', RequestsStub, raising=False)
 
-    # 6) Expose fake_sup for the test to inspect
+    # 6. Expose fake_sup for the test to inspect
     pd._fake_sup = fake_sup
 
     return tmp_path
