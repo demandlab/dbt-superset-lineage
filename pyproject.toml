@@ -2,7 +2,7 @@
 name = "dbt-superset-lineage"
 version = "0.3.5"
 description = "Fork of slidoapp/dbt-superset-lineage: Make dbt docs and Apache Superset talk to one another"
-authors = ["Michal Kolacek <mkolacek@slidoapp.com>", "Insentric Development Team <insentric-dev@demandlab.com>"]
+authors = ["Michal Kolacek <mkolacek@slido.com>", "Insentric Development Team <insentric-dev@demandlab.com>"]
 readme = "README.md"
 repository = "https://github.com/demandlab/dbt-superset-lineage"
 homepage = "https://github.com/demandlab/dbt-superset-lineage"
