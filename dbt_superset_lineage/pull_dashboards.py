@@ -1,19 +1,41 @@
+"""
+pull_dashboards.py
+
+Extract dashboard definitions and their underlying datasets from Superset,
+and convert them into dbt exposures. Parses SQL for lineage via SQLFluff
+with regex fallback. Generates a dbt-v1.3-compatible exposures YAML file.
+"""
+
 import json
 import logging
 import re
-
 from pathlib import Path
 from requests import HTTPError
+
 import ruamel.yaml
 import sqlfluff
 
 from .superset_api import Superset
 
-logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=logging.INFO)
-logging.getLogger('sqlfluff').setLevel(level=logging.WARNING)
+# Configure root logging
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("sqlfluff").setLevel(logging.WARNING)
 
 
 def crawl_recursive(seq, key):
+    """
+    Recursively yield values for `key` in a nested dict/list.
+
+    Args:
+        seq (dict | list): The structure to traverse.
+        key (str): The dict key to match.
+
+    Yields:
+        The values found under `key`.
+    """
     if isinstance(seq, dict):
         for k, v in seq.items():
             if k == key:
@@ -21,337 +43,424 @@ def crawl_recursive(seq, key):
             else:
                 yield from crawl_recursive(v, key)
     elif isinstance(seq, list):
-        for i in seq:
-            yield from crawl_recursive(i, key)
+        for item in seq:
+            yield from crawl_recursive(item, key)
 
 
 def get_tables_from_sql_fluff(sql, dialect):
-    sql_parsed = sqlfluff.parse(sql=sql, dialect=dialect)
-    tables_references = crawl_recursive(sql_parsed, 'table_reference')
+    """
+    Use SQLFluff to extract table references from SQL.
 
-    tables = set()  # to avoid duplicates
-    for identifier in ['naked_identifier', 'quoted_identifier']:
-        tables_parsed = [list(crawl_recursive(table_ref, identifier)) for table_ref in tables_references]
-        tables_cleaned = ['.'.join(table).replace('"', '').lower()
-                          for table in tables_parsed
-                          if len(table) >= 2]  # full name if with schema
-        tables.update(tables_cleaned)
+    Args:
+        sql (str): The SQL string to parse.
+        dialect (str): The SQLFluff dialect to use.
 
+    Returns:
+        set[str]: Table references like 'schema.table' or 'table'.
+    """
+    parsed = sqlfluff.parse(sql=sql, dialect=dialect)
+    refs = crawl_recursive(parsed, "table_reference")
+
+    tables = set()
+    for ident in ("naked_identifier", "quoted_identifier"):
+        fragments = [list(crawl_recursive(r, ident)) for r in refs]
+        cleaned = [
+            ".".join(frag).replace('"', "").lower()
+            for frag in fragments
+            if len(frag) >= 2
+        ]
+        tables.update(cleaned)
     return tables
 
 
 def get_tables_from_sql_simple(sql):
-    sql = re.sub(r'(--.*)|(#.*)', '', sql)  # remove line comments
-    sql = re.sub(r'\s+', ' ', sql).lower()  # make it one line
-    sql = re.sub(r'(/\*(.|\n)*\*/)', '', sql)  # remove block comments
+    """
+    Fallback regex extraction of table names for simple SQL.
 
-    regex = re.compile(r'\b(from|join)\b\s+(\"?(\w+)\"?(\.))?\"?(\w+)\"?\b')  # regex for tables
-    tables_match = regex.findall(sql)
-    tables = [table[2] + '.' + table[4] if table[2] != '' else table[4]  # full name if with schema
-              for table in tables_match
-              if table[4] != 'unnest']  # remove false positive
-    tables = set(tables)  # remove duplicates
+    Args:
+        sql (str): The SQL string to analyze.
 
+    Returns:
+        set[str]: Table names found via regex.
+    """
+    # strip comments
+    sql = re.sub(r"(--.*)|(#.*)", "", sql)
+    sql = re.sub(r"(/\*(.|\n)*\*/)", "", sql)
+    sql = re.sub(r"\s+", " ", sql).lower()
+
+    pattern = re.compile(
+        r"\b(from|join)\b\s+(\"?(\w+)\"?(\.))?\"?(\w+)\"?\b"
+    )
+    matches = pattern.findall(sql)
+    tables = {
+        f"{m[2]}.{m[4]}" if m[2] else m[4]
+        for m in matches
+        if m[4] != "unnest"
+    }
     return tables
 
 
 def get_tables_from_sql(sql, dialect):
+    """
+    Try SQLFluff parse, else regex fallback, to list tables.
+
+    Args:
+        sql (str): SQL to scan.
+        dialect (str): SQLFluff dialect.
+
+    Returns:
+        list[str]: Identified table references.
+    """
     try:
-        tables = get_tables_from_sql_fluff(sql=sql, dialect=dialect)
-    except (sqlfluff.core.errors.SQLParseError,
-            sqlfluff.core.errors.SQLLexError,
-            sqlfluff.api.simple.APIParsingError) as e:
-        logging.warning("Parsing SQL through sqlfluff failed. "
-                        "Let me attempt this via regular expressions at least and "
-                        "check the problematic query and error below.\n%s",
-                        sql, exc_info=e)
-        tables = get_tables_from_sql_simple(sql)
-
-    tables = list(tables)  # turn set back into list
-
-    return tables
+        tbls = get_tables_from_sql_fluff(sql=sql, dialect=dialect)
+    except (
+        sqlfluff.core.errors.SQLParseError,
+        sqlfluff.core.errors.SQLLexError,
+        sqlfluff.api.simple.APIParsingError,
+    ) as e:
+        logging.warning(
+            "SQLFluff parse failed; falling back to regex. SQL:\n%s", sql,
+            exc_info=e
+        )
+        tbls = get_tables_from_sql_simple(sql)
+    return list(tbls)
 
 
 def get_tables_from_dbt(dbt_manifest, dbt_db_name):
-    tables = {}
-    for table_type in ['nodes', 'sources']:
-        manifest_subset = dbt_manifest[table_type]
+    """
+    Read 'nodes' & 'sources' from dbt manifest for dashboard exposures.
 
-        for table_key_long in manifest_subset:
-            table = manifest_subset[table_key_long]
-            name = table['name']
-            schema = table['schema']
-            database = table['database']
-            source = table['unique_id'].split('.')[-2]
-            table_key = schema + '.' + name
+    Filters by `dbt_db_name` if provided.
+
+    Args:
+        dbt_manifest (dict): Loaded JSON from target/manifest.json.
+        dbt_db_name (str|None): If set, only tables in this database.
+
+    Returns:
+        dict[str, dict]: Mapping 'schema.table' → metadata:
+          {
+            'name': ..., 'schema': ..., 'database': ...,
+            'type': 'node'|'source', 'ref': "ref(...)" or "source(...)"
+          }
+    """
+    tables = {}
+    for section in ("nodes", "sources"):
+        for _, entry in dbt_manifest[section].items():
+            name = entry["name"]
+            schema = entry["schema"]
+            database = entry["database"]
+            source = entry["unique_id"].split(".")[-2]
+            key = f"{schema}.{name}"
 
             if dbt_db_name is None or database == dbt_db_name:
-                # fail if it breaks uniqueness constraint
-                assert table_key not in tables, \
-                    f"Table {table_key} is a duplicate name (schema + table) across databases. " \
-                    "This would result in incorrect matching between Superset and dbt. " \
-                    "To fix this, remove duplicates or add ``dbt_db_name``."
-                tables[table_key] = {
-                    'name': name,
-                    'schema': schema,
-                    'database': database,
-                    'type': table_type[:-1],
-                    'ref':
-                        f"ref('{name}')" if table_type == 'nodes'
-                        else f"source('{source}', '{name}')"
+                assert key not in tables, (
+                    f"Table {key} duplicates across databases."
+                )
+                tables[key] = {
+                    "name": name,
+                    "schema": schema,
+                    "database": database,
+                    "type": section[:-1],
+                    "ref": (
+                        f"ref('{name}')"
+                        if section == "nodes"
+                        else f"source('{source}','{name}')"
+                    ),
                 }
-
     assert tables, "Manifest is empty!"
-
     return tables
 
 
 def get_dashboards_from_superset(superset, superset_url, superset_db_id):
+    """
+    Fetch published dashboards and their "schema.table" datasets.
+
+    Args:
+        superset (Superset): Authenticated client.
+        superset_url (str): Base URL (no /api/v1).
+        superset_db_id (int|None): If set, filter datasets by DB ID.
+
+    Returns:
+        tuple[list[dict], set[str]]:
+          - dashboards: each with 'id','title','url','owner_name','datasets'
+          - set of all "schema.table" keys used.
+    """
     logging.info("Getting published dashboards from Superset.")
-    page_number = 0
-    dashboards_id = []
+    page = 0
+    dash_ids = []
     while True:
-        logging.info("Getting page %d.", page_number + 1)
-
-        payload = {
-            'q': json.dumps({
-                'page': page_number,
-                'page_size': 100
-            })
-        }
-        res = superset.request('GET', '/dashboard/', params=payload)
-
-        result = res['result']
-        if result:
-            for r in result:
-                if r['published']:
-                    dashboards_id.append(r['id'])
-            page_number += 1
-        else:
+        payload = {"q": json.dumps({"page": page, "page_size": 100})}
+        res = superset.request("GET", "/dashboard/", params=payload)
+        result = res["result"]
+        if not result:
             break
+        for d in result:
+            if d.get("published"):
+                dash_ids.append(d["id"])
+        page += 1
 
-    assert dashboards_id, "There are no published dashboards in Superset!"
-
-    logging.info("There are %d published dashboards in Superset.", len(dashboards_id))
-
+    assert dash_ids, "No published dashboards found!"
     dashboards = []
-    dashboards_datasets_w_db = set()
-    for i, d in enumerate(dashboards_id):
+    ds_w_db = set()
+    for idx, did in enumerate(dash_ids, start=1):
         try:
-            logging.info("Getting info for dashboard %d/%d.", i + 1, len(dashboards_id))
-            res_dashboard = superset.request('GET', f'/dashboard/{d}')
-            result_dashboard = res_dashboard['result']
+            logging.info("Processing dashboard %d/%d.", idx, len(dash_ids))
+            dash = superset.request("GET", f"/dashboard/{did}")["result"]
+            owner = dash["owners"][0]
+            owner_name = f"{owner['first_name']} {owner['last_name']}"
+            url = f"{superset_url}/superset/dashboard/{did}"
 
-            dashboard_id = result_dashboard['id']
-            title = result_dashboard['dashboard_title']
-            url = superset_url + '/superset/dashboard/' + str(dashboard_id)
-            owner_name = result_dashboard['owners'][0]['first_name'] + ' ' + result_dashboard['owners'][0]['last_name']
+            ds_list = superset.request("GET", f"/dashboard/{did}/datasets")["result"]
+            parsed = [
+                [d["database"]["name"], d["schema"], d["table_name"]]
+                for d in ds_list
+            ]
+            # replace None → "None"
+            parsed = [
+                ["None" if p is None else p for p in trip]
+                for trip in parsed
+            ]
+            with_db = [".".join(trip) for trip in parsed]
+            wo_db   = [".".join(trip[1:]) for trip in parsed]
+            ds_w_db.update(with_db)
 
-            logging.info("Getting info about dashboard's datasets.")
-            res_datasets = superset.request('GET', f'/dashboard/{d}/datasets')
-            result_datasets = res_datasets['result']
-
-            # parse dataset names split into parts
-            datasets_parsed = [[dataset['database']['name'], dataset['schema'], dataset['table_name']]
-                               for dataset in result_datasets]
-            datasets_parsed = [['None' if x is None else x for x in dataset]
-                               for dataset in datasets_parsed]  # replace None with string "None" if something missing
-
-            # put them all together to get "database.schema.table"
-            datasets_w_db = ['.'.join(dataset) for dataset in datasets_parsed]
-            dashboards_datasets_w_db.update(datasets_w_db)
-
-            # skip database, i.e. first item, to get only "schema.table"
-            datasets_wo_db = ['.'.join(dataset[1:]) for dataset in datasets_parsed]
-
-            dashboard = {
-                'id': dashboard_id,
-                'title': title,
-                'url': url,
-                'owner_name': owner_name,
-                'datasets': datasets_wo_db  # add in "schema.table" format
-            }
-            dashboards.append(dashboard)
-        except HTTPError as e:
-            logging.error("Info about the dashboard with ID=%d wasn't (fully) obtained. "
-                          "Check the error below.", d, exc_info=e)
-
-    # test if unique when database disregarded
-    # loop to get the name of duplicated dataset and work with unique set of datasets w db
-    dashboards_datasets = set()
-    for dataset_w_db in dashboards_datasets_w_db:
-        dataset = '.'.join(dataset_w_db.split('.')[1:])  # similar logic as just a bit above
-
-        # fail if it breaks uniqueness constraint and not limited to one database
-        assert dataset not in dashboards_datasets or superset_db_id is not None, \
-            f"Dataset {dataset} is a duplicate name (schema + table) across databases. " \
-            "This would result in incorrect matching between Superset and dbt. " \
-            "To fix this, remove duplicates or add ``superset_db_id``."
-
-        dashboards_datasets.add(dataset)
-
-    return dashboards, dashboards_datasets
-
-
-def get_datasets_from_superset(superset, dashboards_datasets, dbt_tables,
-                               sql_dialect, superset_db_id):
-    logging.info("Getting datasets info from Superset.")
-    page_number = 0
-    datasets = {}
-    while True:
-        logging.info("Getting page %d.", page_number + 1)
-
-        payload = {
-            'q': json.dumps({
-                'page': page_number,
-                'page_size': 100
+            dashboards.append({
+                "id": did,
+                "title": dash["dashboard_title"],
+                "url": url,
+                "owner_name": owner_name,
+                "datasets": wo_db,
             })
-        }
-        res = superset.request('GET', '/dataset/', params=payload)
+        except HTTPError as e:
+            logging.error(
+                "Failed to fetch dashboard %d info.", did, exc_info=e
+            )
 
-        result = res['result']
-        if result:
-            for r in result:
-                name = r['table_name']
-                schema = r['schema']
-                database_name = r['database']['database_name']
-                database_id = r['database']['id']
+    # enforce schema.table uniqueness if no superset_db_id
+    seen = set()
+    for full in ds_w_db:
+        key = ".".join(full.split(".")[1:])
+        assert key not in seen or superset_db_id is not None, (
+            f"Dataset {key} duplicates across DBs; "
+            "set superset_db_id to disambiguate."
+        )
+        seen.add(key)
 
-                dataset_key = f'{schema}.{name}'  # same format as in dashboards
+    return dashboards, seen
 
-                # only add datasets that are in dashboards, optionally limit to one database
-                if dataset_key in dashboards_datasets \
-                        and (superset_db_id is None or database_id == superset_db_id):
-                    kind = r['kind']
-                    if kind == 'virtual':  # built on custom sql
-                        sql = r['sql']
-                        tables = get_tables_from_sql(sql, sql_dialect)
-                        tables = [table if '.' in table else f'{schema}.{table}'
-                                  for table in tables]
-                    else:  # built on tables
-                        tables = [dataset_key]
-                    dbt_refs = [dbt_tables[table]['ref'] for table in tables
-                                if table in dbt_tables]
 
-                    datasets[dataset_key] = {
-                        'name': name,
-                        'schema': schema,
-                        'database': database_name,
-                        'kind': kind,
-                        'tables': tables,
-                        'dbt_refs': dbt_refs
-                    }
-            page_number += 1
-        else:
+def get_datasets_from_superset(
+    superset,
+    dashboards_datasets,
+    dbt_tables,
+    sql_dialect,
+    superset_db_id,
+):
+    """
+    Fetch dataset details and map to dbt refs for exposures.
+
+    Args:
+        superset (Superset): Authenticated client.
+        dashboards_datasets (set[str]): Keys "schema.table" to include.
+        dbt_tables (dict): Output of get_tables_from_dbt().
+        sql_dialect (str): SQLFluff dialect.
+        superset_db_id (int|None): Filter by DB ID.
+
+    Returns:
+        dict[str, dict]: Mapping "schema.table" → metadata with:
+          'kind','tables','dbt_refs', etc.
+    """
+    page = 0
+    result = {}
+    while True:
+        payload = {"q": json.dumps({"page": page, "page_size": 100})}
+        res = superset.request("GET", "/dataset/", params=payload)
+        rows = res["result"]
+        if not rows:
             break
 
-    return datasets
+        for r in rows:
+            key = f"{r['schema']}.{r['table_name']}"
+            dbid = r["database"]["id"]
+            if key in dashboards_datasets and (
+                superset_db_id is None or dbid == superset_db_id
+            ):
+                kind = r["kind"]
+                if kind == "virtual":
+                    tbls = get_tables_from_sql(r["sql"], sql_dialect)
+                    tbls = [
+                        t if "." in t else f"{r['schema']}.{t}"
+                        for t in tbls
+                    ]
+                else:
+                    tbls = [key]
+                refs = [
+                    dbt_tables[t]["ref"]
+                    for t in tbls
+                    if t in dbt_tables
+                ]
+                result[key] = {
+                    "name": r["table_name"],
+                    "schema": r["schema"],
+                    "database": r["database"]["database_name"],
+                    "kind": kind,
+                    "tables": tbls,
+                    "dbt_refs": refs,
+                }
+        page += 1
+
+    return result
 
 
 def merge_dashboards_with_datasets(dashboards, datasets):
-    for dashboard in dashboards:
-        refs = set()
-        for dataset in dashboard['datasets']:
-            if dataset in datasets:
-                refs.update(datasets[dataset]['dbt_refs'])
-        refs = list(sorted(refs))
+    """
+    Annotate each dashboard with the set of dbt refs it depends on.
 
-        dashboard['refs'] = refs
+    Args:
+        dashboards (list[dict]): Output of get_dashboards_from_superset.
+        datasets (dict): Output of get_datasets_from_superset.
 
+    Returns:
+        list[dict]: Each dashboard has added `refs` (sorted list[str]).
+    """
+    for dash in dashboards:
+        refs = {
+            ref
+            for ds in dash["datasets"]
+            if ds in datasets
+            for ref in datasets[ds]["dbt_refs"]
+        }
+        dash["refs"] = sorted(refs)
     return dashboards
 
 
 def get_exposures_dict(dashboards, exposures):
-    dashboards.sort(key=lambda dashboard: dashboard['id'])
-    titles = [dashboard['title'] for dashboard in dashboards]
-    # fail if it breaks uniqueness constraint for exposure names
-    assert len(set(titles)) == len(titles), "There are duplicate dashboard names!"
+    """
+    Merge existing exposures with newly harvested dashboards.
 
-    exposures_orig = {exposure['url']: exposure for exposure in exposures}
-    exposures_dict = [{
-        # remove non-word characters (unless it's space), replace spaces with underscores, make lowercase
-        # required since dbt v1.3
-        'name': re.sub(r'[^\w ]+', '', dashboard['title']).replace(' ', '_').lower(),
-        'label': dashboard['title'],
-        'type': 'dashboard',
-        'url': dashboard['url'],
-        # get descriptions from original file through url (unique as it's based on dashboard id)
-        'description': exposures_orig.get(dashboard['url'], {}).get('description', ''),
-        'depends_on': dashboard['refs'],
-        'owner': {
-            'name': dashboard['owner_name'],
-            'email': ''  # required for dbt to accept owner.name but not in response
-        }
-    } for dashboard in dashboards]
+    Args:
+        dashboards (list[dict]): Dashboards with `refs`.
+        exposures (list[dict]): Previously-loaded exposures from YAML.
 
-    return exposures_dict
+    Returns:
+        list[dict]: New list of exposures ready for YAML dump.
+    """
+    dashboards.sort(key=lambda d: d["id"])
+    titles = [d["title"] for d in dashboards]
+    assert len(set(titles)) == len(titles), "Duplicate dashboard names!"
+    orig = {e["url"]: e for e in exposures}
+
+    result = []
+    for d in dashboards:
+        name = (
+            re.sub(r"[^\w ]+", "", d["title"])
+            .replace(" ", "_")
+            .lower()
+        )
+        result.append({
+            "name": name,
+            "label": d["title"],
+            "type": "dashboard",
+            "url": d["url"],
+            "description": orig.get(d["url"], {}).get("description", ""),
+            "depends_on": d["refs"],
+            "owner": {"name": d["owner_name"], "email": ""},
+        })
+    return result
 
 
 class YamlFormatted(ruamel.yaml.YAML):
+    """
+    Custom ruamel.yaml YAML dumper with consistent formatting.
+    """
     def __init__(self):
-        super(YamlFormatted, self).__init__()
+        super().__init__()  # Python 3 style
         self.default_flow_style = False
         self.allow_unicode = True
-        self.encoding = 'utf-8'
+        self.encoding = "utf-8"
         self.block_seq_indent = 2
         self.indent = 4
 
 
-def main(dbt_project_dir, exposures_path, dbt_db_name,
-         superset_url, superset_db_id, sql_dialect,
-         superset_access_token, superset_refresh_token):
+def main(
+    dbt_project_dir,
+    exposures_path,
+    dbt_db_name,
+    *,
+    superset_url,
+    superset_db_id=None,
+    sql_dialect,
+    superset_access_token,
+    superset_refresh_token,
+):
+    """
+    Entry point: load manifest, pull dashboards, and write exposures YAML.
 
-    # require at least one token for Superset
-    assert superset_access_token is not None or superset_refresh_token is not None, \
-           "Add ``SUPERSET_ACCESS_TOKEN`` or ``SUPERSET_REFRESH_TOKEN`` " \
-           "to your environment variables or provide in CLI " \
-           "via ``superset-access-token`` or ``superset-refresh-token``."
+    Workflow:
+      1. Load dbt manifest from
+         <dbt_project_dir>/target/manifest.json.
+      2. Load existing exposures YAML (if any).
+      3. Crawl Superset dashboards & datasets.
+      4. Merge with dbt refs and existing exposures.
+      5. Dump updated exposures to `exposures_path`.
 
-    superset = Superset(superset_url + '/api/v1',
-                        access_token=superset_access_token, refresh_token=superset_refresh_token)
+    Args:
+        dbt_project_dir (str): dbt project root.
+        exposures_path (str): Path to exposures YAML (within project).
+        dbt_db_name (str|None): Filter manifest tables by this DB name.
+        superset_url (str): Base Superset URL (no `/api/v1`).
+        superset_db_id (int|None): Filter Superset by this DB ID.
+        sql_dialect (str): SQLFluff dialect for parsing virtual tables.
+        superset_access_token (str): Superset access token.
+        superset_refresh_token (str): Superset refresh token.
 
-    logging.info("Starting the script!")
+    Raises:
+        AssertionError: If authentication is missing.
+    """
+    assert superset_access_token or superset_refresh_token, (
+        "Provide SUPERSET_ACCESS_TOKEN or SUPERSET_REFRESH_TOKEN."
+    )
 
-    with open(f'{dbt_project_dir}/target/manifest.json') as f:
+    client = Superset(
+        f"{superset_url}/api/v1",
+        access_token=superset_access_token,
+        refresh_token=superset_refresh_token,
+    )
+
+    logging.info("Starting dashboard pull script.")
+    manifest_file = f"{dbt_project_dir}/target/manifest.json"
+    with open(manifest_file, encoding="utf-8") as f:
         dbt_manifest = json.load(f)
 
-    exposures_yaml_path = dbt_project_dir + exposures_path
-
+    yaml_path = dbt_project_dir + exposures_path
     try:
-        with open(exposures_yaml_path) as f:
-            yaml = ruamel.yaml.YAML(typ='safe')
-            exposures = yaml.load(f)['exposures']
+        with open(yaml_path, encoding="utf-8") as f:
+            safe = ruamel.yaml.YAML(typ="safe")
+            exposures = safe.load(f).get("exposures", [])
     except (FileNotFoundError, TypeError):
-        Path(exposures_yaml_path).parent.mkdir(parents=True, exist_ok=True)
-        Path(exposures_yaml_path).touch(exist_ok=True)
-        exposures = {}
+        Path(yaml_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(yaml_path).touch(exist_ok=True)
+        exposures = []
 
     dbt_tables = get_tables_from_dbt(dbt_manifest, dbt_db_name)
-    dashboards, dashboards_datasets = get_dashboards_from_superset(superset,
-                                                                   superset_url,
-                                                                   superset_db_id)
-    datasets = get_datasets_from_superset(superset,
-                                          dashboards_datasets,
-                                          dbt_tables,
-                                          sql_dialect,
-                                          superset_db_id)
+    dashboards, dash_ds = get_dashboards_from_superset(
+        client, superset_url, superset_db_id
+    )
+    datasets = get_datasets_from_superset(
+        client, dash_ds, dbt_tables, sql_dialect, superset_db_id
+    )
     dashboards = merge_dashboards_with_datasets(dashboards, datasets)
-    exposures_dict = get_exposures_dict(dashboards, exposures)
+    exposures_list = get_exposures_dict(dashboards, exposures)
 
-    # insert empty line before each exposure, except the first
-    exposures_yaml = ruamel.yaml.comments.CommentedSeq(exposures_dict)
-    for e in range(len(exposures_yaml)):
-        if e != 0:
-            exposures_yaml.yaml_set_comment_before_after_key(e, before='\n')
+    # Insert blank line before each exposure except the first
+    seq = ruamel.yaml.comments.CommentedSeq(exposures_list)
+    for idx in range(1, len(seq)):
+        seq.yaml_set_comment_before_after_key(idx, before="\n")
 
-    exposures_yaml_schema = {
-        'version': 2,
-        'exposures': exposures_yaml
-    }
+    out = {"version": 2, "exposures": seq}
+    dumper = YamlFormatted()
+    with open(yaml_path, "w+", encoding="utf-8") as f:
+        dumper.dump(out, f)
 
-    exposures_yaml_file = YamlFormatted()
-    with open(exposures_yaml_path, 'w+', encoding='utf-8') as f:
-        exposures_yaml_file.dump(exposures_yaml_schema, f)
-
-    logging.info("Transferred into a YAML file at %s.", exposures_yaml_path)
+    logging.info("Wrote exposures to %s", yaml_path)
     logging.info("All done!")

@@ -1,0 +1,139 @@
+name: CI
+
+on:
+  pull_request:
+    types: [review_requested, labeled]
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+env:
+  PAT_GITHUB: ${{ secrets.PAT_GITHUB }}
+  CODACY_TOKEN: ${{ secrets.CODACY_TOKEN }}
+  DBT_PROJECT_DIR: ${{ github.workspace }}
+  SUPERSET_URL: ${{ secrets.SUPERSET_URL }}
+  SUPERSET_ACCESS_TOKEN: ${{ secrets.SUPERSET_ACCESS_TOKEN }}
+  SUPERSET_REFRESH_TOKEN: ${{ secrets.SUPERSET_REFRESH_TOKEN }}
+  SUPERSET_DB_ID: ${{ secrets.SUPERSET_DB_ID }}
+  TEST_DATASET_ID: ${{ secrets.TEST_DATASET_ID }}
+
+jobs:
+  lint:
+    name: Lint
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache Poetry & pip
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install --no-interaction --no-ansi
+
+      - name: Run pylint
+        run: poetry run pylint dbt_superset_lineage
+
+  static-tests:
+    name: Static Tests & Coverage
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache Poetry & pip
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install --no-interaction --no-ansi
+
+      - name: Run static tests with coverage
+        run: |
+          poetry run pytest -vv --disable-warnings --maxfail=1 \
+            -m "not live" \
+            --cov=dbt_superset_lineage --cov-report=lcov
+
+      - name: Send coverage to Codacy
+        uses: codacy/codacy-coverage-reporter-action@v1
+        with:
+          api-token: ${{ env.CODACY_TOKEN }}
+          coverage-reports: coverage/lcov.info
+
+  live-tests:
+    name: Live Superset Update Tests
+    if: github.event.action != 'labeled' || github.event.label.name == 'ci:test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache Poetry & pip
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/pypoetry
+            ~/.cache/pip
+          key: ${{ runner.os }}-poetry-${{ hashFiles('**/poetry.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-poetry-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install poetry
+          poetry install --no-interaction --no-ansi
+
+      - name: Run live tests
+        run: poetry run pytest -vv --disable-warnings --maxfail=1 -m live
+
+  remove-label:
+    name: Remove `ci:test` Label
+    if: github.event.action == 'labeled' && github.event.label.name == 'ci:test'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Remove the `ci:test` label
+        run: |
+          curl --fail --output /dev/null \
+            -X DELETE \
+            -H "Accept: application/vnd.github.v3+json" \
+            -H "Authorization: token ${{ env.PAT_GITHUB }}" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.number }}/labels/ci:test" || true
